@@ -10,8 +10,10 @@ file_pass <- file.path(dir_data, "s3_overpasses.csv")
 file_out <- file.path(dir_out, "s3_overpasses_tower.csv")
 
 
+
 # ==============================================================================
-# apertura dei file con i metadati e con i tempi
+# Orari a partire da Sentinel-3 e selezione
+# ==============================================================================
 meta <- fread(file_meta)
 pass <- fread(file_pass)
 pass[, time_utc := as.POSIXct(time_utc, tz = "UTC")]
@@ -81,18 +83,29 @@ eddy_heights_dated <- function(zip, s) {
                     z = as.numeric(h$VAR_INFO_HEIGHT)))
 }
 
-# canopy height surveys (90th percentile, whole stand, alive trees) with their date
-canopy_dated <- function(zip, s) {
+
+# all canopy height groups of a station, one row per group
+canopy_all <- function(zip, s) {
   an <- read_zip(zip, s, "ANCILLARY")[VARIABLE_GROUP == "GRP_HEIGHTC"]
-  g  <- setdiff(an[VARIABLE == "HEIGHTC_STATISTIC" & DATAVALUE == "90th Percentile", GROUP_ID],
-                an[VARIABLE == "HEIGHTC_SPP" | (VARIABLE == "HEIGHTC_VEG_STATUS" & DATAVALUE != "Alive"), GROUP_ID])
-  if (length(g) == 0) return(NULL)
-  h  <- dcast(an[GROUP_ID %in% g & VARIABLE %in% c("HEIGHTC", "HEIGHTC_DATE_START")],
-              GROUP_ID ~ VARIABLE, value.var = "DATAVALUE")
-  if (!"HEIGHTC_DATE_START" %in% names(h)) return(NULL)
-  h <- data.table(site = s, date = as.Date(substr(h$HEIGHTC_DATE_START, 1, 8), "%Y%m%d"),
-                  hc = as.numeric(h$HEIGHTC))
-  h[!is.na(date) & !is.na(hc)]
+  if (nrow(an) == 0) return(NULL)
+  w <- dcast(an, GROUP_ID ~ VARIABLE, value.var = "DATAVALUE")
+  col_or_na <- function(col) if (col %in% names(w)) w[[col]] else NA
+  data.table(site = s, hc = as.numeric(col_or_na("HEIGHTC")), stat = col_or_na("HEIGHTC_STATISTIC"),
+             species = col_or_na("HEIGHTC_SPP"), status = col_or_na("HEIGHTC_VEG_STATUS"),
+             date = as.Date(substr(col_or_na("HEIGHTC_DATE_START"), 1, 8), "%Y%m%d"))
+}
+
+stat_order <- "Mean"     # same canopy statistic for every station
+
+# canopy height values of one station: whole stand if available, otherwise tallest species
+choose_canopy <- function(h) {
+  h <- h[!is.na(hc) & (is.na(status) | status == "Alive") & stat %in% stat_order]
+  if (nrow(h) == 0) return(NULL)
+  level <- if (any(is.na(h$species))) "stand" else "species"
+  if (level == "stand") h <- h[is.na(species)]
+  best <- stat_order[stat_order %in% h$stat][1]
+  h <- h[stat == best, .(hc = max(hc)), by = .(site, date)]
+  h[, source := paste(level, best)]
 }
 
 
@@ -105,7 +118,7 @@ zips <- list.files(dir_icos, pattern = "^ICOSETC_.*zip$", full.names = TRUE)
 names(zips) <- substr(basename(zips), 9, 14) 
 
 extract_site <- function(s) {
-  # prende ts dal passaggio S3
+  # prendere ts dal passaggio S3
   ts <- pass[site == s, TIMESTAMP_START]
   # estrazione deivalori per le variabili selezionate e per l'ora di passaggio
   hh <- read_cols(zips[s], s, "FLUXNET_HH", cols_hh)[TIMESTAMP_START %in% ts]
@@ -134,7 +147,8 @@ out <- merge(out, meta[, .(site, igbp, lat, lon)], by = "site", all.x = TRUE)
 # tabella delle altezze del sistema per stazione
 z_tab  <- rbindlist(Map(eddy_heights_dated, zips, names(zips))); z_tab
 # tabella delle altezze della chioma per stazione
-hc_tab <- rbindlist(Map(canopy_dated, zips, names(zips))); hc_tab
+hc_all <- rbindlist(Map(canopy_all, zips, names(zips)), fill = TRUE)
+hc_tab <- rbindlist(lapply(split(hc_all, by = "site"), choose_canopy)); unique(hc_tab[, .(site, source)]); hc_tab
 setorder(z_tab, site, from); setorder(hc_tab, site, date)
 
 # aggiunta alla tabella out della colonna date con giorno di passaggio
@@ -147,11 +161,15 @@ out[, z_eddy := {
 }, by = site]
 
 # Assegnazione a ogni passaggio dell’altezza della chioma in quel giorno
+# canopy height: interpolated between dated surveys, otherwise median of undated values
 out[, h_canopy := {
   ht <- hc_tab[site == .BY$site]
-  if (nrow(ht) > 1) approx(as.numeric(ht$date), ht$hc, xout = as.numeric(date), rule = 2, ties = mean)$y
-  else if (nrow(ht) == 1) rep(ht$hc, .N) else NA_real_
+  hd <- ht[!is.na(date)]
+  if (nrow(hd) > 1) approx(as.numeric(hd$date), hd$hc, xout = as.numeric(date), rule = 2, ties = mean)$y
+  else if (nrow(ht) > 0) rep(if (nrow(hd) == 1) hd$hc else median(ht$hc), .N)
+  else NA_real_
 }, by = site]
+out <- merge(out, unique(hc_tab[, .(site, hc_source = source)]), by = "site", all.x = TRUE)
 
 # effective measurement height
 out[, zm := z_eddy - 0.67 * h_canopy]                             
@@ -164,6 +182,8 @@ out[, .(n           = .N,
         le_measured = round(mean(LE_F_MDS_QC == 0, na.rm = TRUE), 2),
         zm          = round(zm[1], 1)),
     by = site, .SDcols = fp_vars]
+
+out[, .(hc_ok = round(mean(!is.na(h_canopy)), 2)), by = site][hc_ok < 1]
 
 fwrite(out, file_out)
 
